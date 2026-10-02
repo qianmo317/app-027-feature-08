@@ -28,9 +28,12 @@ const selectedContourId = ref<string | null>(null)
 const cursorPt = ref<Pt>({ x: 0, y: 0 })
 const busy = ref('')
 const error = ref('')
+const notice = ref('')
 const showProblems = ref(true)
 const showRules = ref(true)
 const showContour = ref(true)
+const showNesting = ref(true)
+const nestingFilter = ref<'all' | 'uncertain' | 'manual'>('all')
 
 watch(
   project,
@@ -71,6 +74,9 @@ const totalStats = computed(() => {
   let fragments = 0
   let maxDepth = 1
   let dev = 0
+  let uncertain = 0
+  let manual = 0
+  let netArea = 0
   for (const s of shapes.value) {
     const c = store.computedOf(s.id)
     if (!c) continue
@@ -85,6 +91,9 @@ const totalStats = computed(() => {
     ms += c.elapsedMs
     maxDepth = Math.max(maxDepth, c.stats.maxDepth)
     dev = Math.max(dev, c.stats.geometryDeviationMm)
+    uncertain += c.stats.nestingUncertain
+    manual += c.stats.nestingManual
+    netArea += c.stats.netAreaMm2
   }
   return {
     contours,
@@ -98,6 +107,9 @@ const totalStats = computed(() => {
     ms,
     maxDepth,
     dev,
+    uncertain,
+    manual,
+    netArea,
     improve: naive > 1e-9 ? ((naive - travel) / naive) * 100 : 0,
   }
 })
@@ -239,8 +251,10 @@ async function addPattern(slug: string): Promise<void> {
     const text = await fetchPatternText(entry.file)
     const { shape } = store.importSvgToShapes(text, entry.name, p.settings)
     shape.layer = selectedShape.value?.layer ?? 0
-    store.addShape(p, shape)
+    const carried = store.addImportedShapes(p, [shape])
     selectedShapeId.value = shape.id
+    error.value = ''
+    if (carried > 0) notice.value = `已按几何指纹继承 ${carried} 处人工层级判定（同一份图重新导入）`
   } catch (e) {
     error.value = (e as Error).message
   } finally {
@@ -324,6 +338,19 @@ const selMetrics = computed(() => {
   return m ?? null
 })
 
+const selectedNesting = computed(() => {
+  if (!selectedContour.value || !selectedShape.value) return null
+  const comp = store.computedOf(selectedShape.value.id)
+  return comp?.tree.info.get(selectedContour.value.id) ?? null
+})
+
+const selectedParentLabel = computed(() => {
+  const inf = selectedNesting.value
+  if (!inf || !inf.parentId || !selectedShape.value) return '顶层'
+  const idx = selectedShape.value.contours.findIndex((c) => c.id === inf.parentId)
+  return idx >= 0 ? `#${idx + 1}` : '（已删除）'
+})
+
 const computedMap = computed(() => {
   const m = new Map<string, ComputedShape>()
   for (const s of shapes.value) {
@@ -332,6 +359,152 @@ const computedMap = computed(() => {
   }
   return m
 })
+
+// ---------------- 层级判定表 ----------------
+
+const FLAG_TEXT: Record<string, string> = {
+  area_close: '面积接近',
+  boundary_touch: '边界贴边',
+  rep_near_edge: '代表点贴边',
+  ambiguous: '多候选',
+  manual_not_inside: '人工父不包含',
+  manual_parent_missing: '人工父已删除',
+}
+
+type NestRow = {
+  key: string
+  shapeId: string
+  contourId: string
+  index: number
+  label: string
+  parentLabel: string
+  depth: number
+  source: 'auto' | 'manual'
+  flags: string[]
+  flagTexts: string[]
+  gapText: string
+  ratioText: string
+  manualAtText: string
+  parentOptions: Array<{ value: string; label: string }>
+  selectValue: string
+}
+
+const nestingRows = computed<NestRow[]>(() => {
+  const rows: NestRow[] = []
+  for (const s of shapes.value) {
+    const comp = store.computedOf(s.id)
+    if (!comp) continue
+    const tree = comp.tree
+    s.contours.forEach((c, idx) => {
+      const inf = tree.info.get(c.id)
+      if (!inf) return
+      const parent = inf.parentId ? s.contours.find((x) => x.id === inf.parentId) : null
+      const parentIdx = parent ? s.contours.indexOf(parent) : -1
+      const flags = inf.flags
+      const row: NestRow = {
+        key: `${s.id}:${c.id}`,
+        shapeId: s.id,
+        contourId: c.id,
+        index: idx,
+        label: `#${idx + 1}`,
+        parentLabel: parent ? `#${parentIdx + 1}` : '顶层',
+        depth: inf.depth,
+        source: inf.source,
+        flags,
+        flagTexts: flags.map((f) => FLAG_TEXT[f] ?? f),
+        gapText: inf.nearestGapMm !== null ? `${inf.nearestGapMm.toFixed(2)}` : '—',
+        ratioText: inf.parentAreaRatio !== null ? inf.parentAreaRatio.toFixed(2) : '—',
+        manualAtText: inf.manualAt ? new Date(inf.manualAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '',
+        parentOptions: [],
+        selectValue: '__auto__',
+      }
+      // 可选父级：同形状内面积/包围盒更大、且不是自己子孙的轮廓
+      const myNode = tree.nodeById.get(c.id)
+      const descendantIds = new Set<string>()
+      const collect = (nid: string): void => {
+        const n = tree.nodeById.get(nid)
+        if (!n) return
+        for (const ch of n.children) {
+          descendantIds.add(ch.id)
+          collect(ch.id)
+        }
+      }
+      if (myNode) collect(c.id)
+      // 下拉值约定：'top' 人工顶层 / '__auto__' 恢复自动 / 轮廓 id = 人工指定该轮廓为父
+      const opts: NestRow['parentOptions'] = [{ value: '__auto__', label: '自动判定' }]
+      if (inf.source === 'manual' && inf.parentId === null) opts.push({ value: 'top', label: '顶层（人工）' })
+      else opts.push({ value: 'top', label: '顶层' })
+      for (const other of s.contours) {
+        if (other.id === c.id || descendantIds.has(other.id)) continue
+        const oi = s.contours.indexOf(other)
+        const isManualParent = inf.source === 'manual' && inf.parentId === other.id
+        const isAutoParent = inf.source === 'auto' && inf.parentId === other.id
+        opts.push({
+          value: other.id,
+          label: `#${oi + 1}${isManualParent ? '（人工父级）' : isAutoParent ? '（当前自动父级）' : ''}`,
+        })
+      }
+      row.parentOptions = opts
+      row.selectValue = inf.source === 'manual' ? (inf.parentId ?? 'top') : '__auto__'
+      rows.push(row)
+    })
+  }
+  rows.sort((a, b) => a.depth - b.depth || a.index - b.index)
+  if (nestingFilter.value === 'uncertain') return rows.filter((r) => r.flags.length > 0)
+  if (nestingFilter.value === 'manual') return rows.filter((r) => r.source === 'manual')
+  return rows
+})
+
+const nestingSummary = computed(() => {
+  let auto = 0
+  let uncertain = 0
+  let manual = 0
+  for (const s of shapes.value) {
+    const comp = store.computedOf(s.id)
+    if (!comp) continue
+    manual += comp.stats.nestingManual
+    uncertain += comp.stats.nestingUncertain
+    auto += comp.stats.contourCount - comp.stats.nestingManual
+  }
+  return { auto, uncertain, manual }
+})
+
+function onNestingParent(row: NestRow, raw: string): void {
+  const p = project.value
+  if (!p) return
+  if (raw === '__auto__') {
+    store.resetContourNesting(p, row.contourId)
+    return
+  }
+  if (raw === 'top') {
+    store.setContourParent(p, row.contourId, null)
+    return
+  }
+  if (!store.setContourParent(p, row.contourId, raw)) {
+    error.value = '不能把轮廓挂到自己的内层下（会形成循环）'
+  } else {
+    error.value = ''
+  }
+}
+
+function resetRow(row: NestRow): void {
+  const p = project.value
+  if (p) store.resetContourNesting(p, row.contourId)
+}
+
+function resetNestingAll(): void {
+  const p = project.value
+  if (!p) return
+  if (nestingSummary.value.manual === 0) return
+  if (!confirm(`清空全部 ${nestingSummary.value.manual} 处人工层级判定，恢复自动判定？`)) return
+  store.resetAllNesting(p)
+}
+
+function locateRow(row: NestRow): void {
+  selectedShapeId.value = row.shapeId
+  selectedContourId.value = row.contourId
+  canvas.value?.focusContour(row.contourId)
+}
 </script>
 
 <template>
@@ -444,6 +617,8 @@ const computedMap = computed(() => {
           <span v-if="mode === 'toolpath'"><i style="background: #ff8f3c"></i>刀路</span>
           <span v-if="mode === 'toolpath'"><i style="background: #7f8fa3"></i>跳刀</span>
           <span v-if="mode === 'bridge'"><i style="background: #47c07a"></i>连刀点缺口</span>
+          <span v-if="mode !== 'bridge'"><i style="background: #ffc857; transform: rotate(45deg); width: 8px; height: 8px"></i>层级存疑</span>
+          <span v-if="mode !== 'bridge'"><i style="background: transparent; border: 2px solid #5aa9ff; border-radius: 50%"></i>人工改判</span>
         </div>
       </div>
     </div>
@@ -453,6 +628,7 @@ const computedMap = computed(() => {
       <div class="panel-head">属性与规则</div>
       <div class="panel-body">
         <div v-if="error" class="banner err">{{ error }}</div>
+        <div v-if="notice" class="banner ok">{{ notice }}</div>
 
         <div class="stat-grid">
           <div class="stat"><div class="k">轮廓 / 闭合</div><div class="v">{{ totalStats.contours }}<small>/{{ totalStats.closed }}</small></div></div>
@@ -461,6 +637,9 @@ const computedMap = computed(() => {
           <div class="stat"><div class="k">刀路总长</div><div class="v">{{ totalStats.cutLen.toFixed(0) }}<small>mm</small></div></div>
           <div class="stat"><div class="k">跳刀 / 优化</div><div class="v">{{ totalStats.travel.toFixed(0) }}<small>mm · {{ totalStats.improve >= 0 ? '−' : '+' }}{{ Math.abs(totalStats.improve).toFixed(1) }}%</small></div></div>
           <div class="stat"><div class="k">嵌套层数</div><div class="v">{{ totalStats.maxDepth }}</div></div>
+          <div class="stat"><div class="k">层级存疑</div><div class="v" :style="{ color: totalStats.uncertain ? 'var(--warn)' : '' }">{{ totalStats.uncertain }}</div></div>
+          <div class="stat"><div class="k">人工改判</div><div class="v" :style="{ color: totalStats.manual ? '#5aa9ff' : '' }">{{ totalStats.manual }}</div></div>
+          <div class="stat"><div class="k">净面积</div><div class="v">{{ totalStats.netArea.toFixed(0) }}<small>mm²</small></div></div>
           <div class="stat"><div class="k">几何偏差</div><div class="v">{{ totalStats.dev.toFixed(3) }}<small>mm</small></div></div>
           <div class="stat"><div class="k">计算耗时</div><div class="v">{{ totalStats.ms.toFixed(1) }}<small>ms</small></div></div>
         </div>
@@ -484,6 +663,77 @@ const computedMap = computed(() => {
         </div>
 
         <div class="section">
+          <div class="section-title" @click="showNesting = !showNesting">
+            层级判定表
+            <span class="tag" :class="nestingSummary.uncertain ? 'warn' : 'ok'">{{ nestingSummary.uncertain }} 存疑</span>
+            <span v-if="nestingSummary.manual" class="tag info">{{ nestingSummary.manual }} 人工</span>
+            <span class="spacer"></span>
+            <button class="tiny" @click.stop="resetNestingAll" :disabled="!nestingSummary.manual">全部恢复自动</button>
+          </div>
+          <div v-show="showNesting" class="nesting-panel">
+            <div class="hint">
+              自动按「面积大 + 代表点落在内」认父子；外框断裂、贴边时会认错。存疑的行已标出，可在「父级」列直接改，顺序 / 刀补方向 / 净面积立即重算。
+            </div>
+            <div class="filter-row">
+              <button class="tiny" :class="{ active: nestingFilter === 'all' }" @click="nestingFilter = 'all'">全部 {{ totalStats.contours }}</button>
+              <button class="tiny" :class="{ active: nestingFilter === 'uncertain' }" @click="nestingFilter = 'uncertain'">仅存疑 {{ nestingSummary.uncertain }}</button>
+              <button class="tiny" :class="{ active: nestingFilter === 'manual' }" @click="nestingFilter = 'manual'">仅人工 {{ nestingSummary.manual }}</button>
+            </div>
+            <div class="nesting-scroll">
+              <table class="nest-table">
+                <thead>
+                  <tr>
+                    <th>轮廓</th>
+                    <th>父级</th>
+                    <th>层深</th>
+                    <th>判定</th>
+                    <th>存疑原因 / 数值</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="r in nestingRows"
+                    :key="r.key"
+                    :class="{ uncertain: r.flags.length > 0, manual: r.source === 'manual', sel: r.contourId === selectedContourId }"
+                    @click="locateRow(r)"
+                  >
+                    <td class="mono">{{ r.label }}</td>
+                    <td class="parent-cell" @click.stop>
+                      <select :value="r.selectValue" @change="onNestingParent(r, ($event.target as HTMLSelectElement).value)">
+                        <option v-for="o in r.parentOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
+                      </select>
+                    </td>
+                    <td class="num depth-cell">L{{ r.depth }}</td>
+                    <td>
+                      <span v-if="r.source === 'manual'" class="tag info" :title="`人工判定于 ${r.manualAtText}`">人工</span>
+                      <span v-else class="tag">自动</span>
+                    </td>
+                    <td class="reason-cell">
+                      <span v-if="r.flags.length === 0" class="hint">—</span>
+                      <div v-else class="flag-stack">
+                        <span v-for="t in r.flagTexts" :key="t" class="tag warn">{{ t }}</span>
+                        <span class="hint mono">
+                          间隙 {{ r.gapText }}mm<template v-if="r.ratioText !== '—'">｜面积比 {{ r.ratioText }}</template>
+                        </span>
+                      </div>
+                    </td>
+                    <td class="op-cell" @click.stop>
+                      <button v-if="r.source === 'manual'" class="tiny" title="恢复自动判定" @click="resetRow(r)">撤</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <div v-if="nestingRows.length === 0" class="empty">没有匹配的轮廓。</div>
+            </div>
+            <div class="hint nesting-foot">
+              改判后自动重算：切割顺序（先内后外）、刀补方向（奇层向外 / 偶层向内）、净面积 {{ totalStats.netArea.toFixed(1) }}mm²。
+              人工判定按几何指纹保存在项目里，重新导入同一份 SVG 会自动继承。
+            </div>
+          </div>
+        </div>
+
+        <div class="section">
           <div class="section-title" @click="showContour = !showContour">
             选中轮廓
             <span class="spacer"></span>
@@ -499,7 +749,13 @@ const computedMap = computed(() => {
                 <div class="stat"><div class="k">周长</div><div class="v">{{ selectedContour.length.toFixed(2) }}<small>mm</small></div></div>
                 <div class="stat"><div class="k">状态</div><div class="v" style="font-size: 12px">{{ selectedContour.closed ? '已闭合' : '未闭合' }}</div></div>
                 <div class="stat"><div class="k">内层数</div><div class="v">{{ selectedContour.holes.length }}</div></div>
+                <div class="stat"><div class="k">所在层深</div><div class="v">{{ selectedNesting?.depth ?? 1 }}</div></div>
+                <div class="stat"><div class="k">父级</div><div class="v" style="font-size: 12px">{{ selectedParentLabel }}</div></div>
+                <div class="stat"><div class="k">判定来源</div><div class="v" style="font-size: 12px">{{ selectedNesting?.source === 'manual' ? '人工' : '自动' }}</div></div>
                 <div class="stat"><div class="k">连刀点</div><div class="v">{{ selMetrics?.anchors.length ?? 0 }}</div></div>
+              </div>
+              <div v-if="selectedNesting && selectedNesting.flags.length" class="hint" style="margin-top: 6px; color: var(--warn)">
+                存疑：{{ selectedNesting.flags.map((f) => FLAG_TEXT[f] ?? f).join('、') }}
               </div>
               <div v-if="selMetrics" class="hint" style="margin-top: 6px">
                 {{ selMetrics.bridgeMetrics.reason }}｜几何偏差 {{ selMetrics.bridgeMetrics.geometryDeviationMm.toFixed(3) }}mm
@@ -600,6 +856,16 @@ const computedMap = computed(() => {
   font-size: 12px;
 }
 
+.banner.ok {
+  background: rgba(71, 192, 122, 0.12);
+  border: 1px solid rgba(71, 192, 122, 0.4);
+  color: #9fe0b8;
+  padding: 6px 8px;
+  border-radius: 5px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
 .section-title {
   cursor: pointer;
 }
@@ -620,5 +886,107 @@ const computedMap = computed(() => {
   font-size: 11px;
   color: var(--text-mute);
   line-height: 1.7;
+}
+
+.nesting-panel {
+  font-size: 12px;
+}
+
+.filter-row {
+  display: flex;
+  gap: 4px;
+  margin: 6px 0;
+}
+
+.filter-row .tiny.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #1a1206;
+}
+
+.nesting-scroll {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+.nest-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+
+.nest-table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2, #1c2530);
+  color: var(--text-dim);
+  font-weight: 500;
+  text-align: left;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.nest-table td {
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--line-soft, rgba(255, 255, 255, 0.06));
+  vertical-align: middle;
+}
+
+.nest-table tbody tr {
+  cursor: pointer;
+}
+
+.nest-table tbody tr:hover {
+  background: rgba(255, 143, 60, 0.06);
+}
+
+.nest-table tr.sel {
+  background: rgba(89, 169, 255, 0.1);
+}
+
+.nest-table tr.uncertain {
+  box-shadow: inset 2px 0 0 var(--warn);
+}
+
+.nest-table tr.manual {
+  box-shadow: inset 2px 0 0 #5aa9ff;
+}
+
+.nest-table .num {
+  text-align: center;
+}
+
+.nest-table select {
+  padding: 1px 2px;
+  font-size: 11px;
+  max-width: 104px;
+}
+
+.parent-cell,
+.op-cell {
+  cursor: default;
+}
+
+.flag-stack {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  align-items: center;
+}
+
+.reason-cell {
+  max-width: 170px;
+}
+
+.depth-cell {
+  color: var(--text-dim);
+}
+
+.nesting-foot {
+  margin-top: 6px;
+  line-height: 1.6;
 }
 </style>

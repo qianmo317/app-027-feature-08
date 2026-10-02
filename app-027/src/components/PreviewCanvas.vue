@@ -5,6 +5,7 @@ import type { ComputedShape } from '@/logic/pipeline'
 import type { Job } from '@/logic/job'
 import type { CutStep } from '@/logic/order'
 import { closestOnPolyline, boundsOf, mergeBounds } from '@/logic/geometry'
+import { fallbackRep } from '@/logic/nesting'
 import type { SheetPlacement } from '@/logic/exporters'
 import { placePoint } from '@/logic/exporters'
 
@@ -329,6 +330,30 @@ const outlineContours = computed<DrawContour[]>(() => {
 
 const pl = (p: Pt): Pt => (props.placement ? placePoint(p, props.placement) : p)
 
+/** 层级判定标记：存疑（黄菱）/ 人工（蓝圈） */
+const nestingMarkers = computed(() => {
+  const out: Array<{ x: number; y: number; uncertain: boolean; manual: boolean; contourId: string; selected: boolean }> = []
+  for (const s of props.shapes) {
+    const comp = props.computed.get(s.id)
+    if (!comp) continue
+    for (const c of s.contours) {
+      const inf = comp.tree.info.get(c.id)
+      if (!inf) continue
+      if (inf.flags.length === 0 && inf.source !== 'manual') continue
+      const rep = inf.rep ?? fallbackRep(c)
+      out.push({
+        x: rep.x,
+        y: rep.y,
+        uncertain: inf.flags.length > 0,
+        manual: inf.source === 'manual',
+        contourId: c.id,
+        selected: c.id === props.selectedContourId,
+      })
+    }
+  }
+  return out
+})
+
 const cutSteps = computed<CutStep[]>(() => {
   if (props.job) return props.job.steps
   const out: CutStep[] = []
@@ -544,6 +569,32 @@ function focusContour(id: string): void {
             :stroke-width="p.selected ? 2.4 : 1.7"
             vector-effect="non-scaling-stroke"
           />
+        </g>
+
+        <!-- 层级判定标记：黄菱=存疑，蓝圈=人工改判（点击可选中轮廓） -->
+        <g v-if="mode === 'outline' || mode === 'toolpath'" style="cursor: pointer">
+          <g v-for="(m, i) in nestingMarkers" :key="`nm${i}`" @click.stop="emit('selectContour', m.contourId, shapes.find((s) => s.contours.some((c) => c.id === m.contourId))?.id ?? '')">
+            <rect
+              v-if="m.uncertain"
+              :x="m.x - 3 / zoom"
+              :y="m.y - 3 / zoom"
+              :width="6 / zoom"
+              :height="6 / zoom"
+              :transform="`rotate(45 ${m.x} ${m.y})`"
+              fill="#ffc857"
+              :stroke="m.selected ? '#fff' : '#3a2e10'"
+              :stroke-width="0.8 / zoom"
+            />
+            <circle
+              v-if="m.manual"
+              :cx="m.x"
+              :cy="m.y"
+              :r="(m.uncertain ? 6 : 3.4) / zoom"
+              fill="none"
+              stroke="#5aa9ff"
+              :stroke-width="1.8 / zoom"
+            />
+          </g>
         </g>
 
         <!-- 跳刀 -->

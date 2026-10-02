@@ -137,23 +137,34 @@ export function orderCut(
   walkNaive(tree.roots)
 
   const walkOptimized = (nodes: TreeNode[]): void => {
-    const ids = nodes.filter((n) => ep.has(n.id)).map((n) => n.id)
-    const inner = nodes.filter((n) => !ep.has(n.id))
-    let seq = ids.slice()
-    if (opts.optimize === 'nearest_2opt' && seq.length > 2) {
-      seq = twoOpt(nearestNeighbor(ids, ep, cursorPos), ep, cursorPos)
-    } else if (seq.length > 1) {
-      seq = nearestNeighbor(ids, ep, cursorPos)
-    }
-    for (const id of seq) {
-      const node = nodes.find((n) => n.id === id)
-      if (node) walkOptimized(node.children)
-      for (const run of runsOf.get(id) ?? []) {
-        cursorPos = run.points[run.points.length - 1]
+    // 按层深分批：先切完所有更深的轮廓（任何轮廓的内层都比它深），
+    // 再切本层。这样人工改判出多个顶层根时也不会把外框排到内层之前。
+    const byDepth = new Map<number, TreeNode[]>()
+    const collect = (ns: TreeNode[]): void => {
+      for (const n of ns) {
+        const arr = byDepth.get(n.depth)
+        if (arr) arr.push(n)
+        else byDepth.set(n.depth, [n])
+        collect(n.children)
       }
-      optimized.push(id)
     }
-    for (const node of inner) walkOptimized(node.children)
+    collect(nodes)
+    const depths = [...byDepth.keys()].sort((a, b) => b - a) // 深 → 浅
+    for (const d of depths) {
+      const ids = byDepth.get(d)!.filter((n) => ep.has(n.id)).map((n) => n.id)
+      let seq = ids.slice()
+      if (opts.optimize === 'nearest_2opt' && seq.length > 2) {
+        seq = twoOpt(nearestNeighbor(ids, ep, cursorPos), ep, cursorPos)
+      } else if (seq.length > 1) {
+        seq = nearestNeighbor(ids, ep, cursorPos)
+      }
+      for (const id of seq) {
+        for (const run of runsOf.get(id) ?? []) {
+          cursorPos = run.points[run.points.length - 1]
+        }
+        optimized.push(id)
+      }
+    }
   }
 
   let cursorPos: Pt = opts.start

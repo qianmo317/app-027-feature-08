@@ -6,7 +6,8 @@ import { importSvgText } from './importer'
 import { computeShape } from './pipeline'
 import { buildJob } from './job'
 import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
-import { polygonArea, polylineLength } from './geometry'
+import { polygonArea, polylineLength, contourFingerprint, polygonGap } from './geometry'
+import { buildContainmentTree, AREA_CLOSE_RATIO, BOUNDARY_TOUCH_MM, REP_EDGE_MM } from './nesting'
 
 export type CheckResult = {
   id: string
@@ -450,6 +451,127 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
       '刀补超出轮廓尺度时明确警告并保留原路径（不输出坏路径）',
       !tinyOk && tinyMsg.includes('原路径') && tinyRuns > 0,
       `0.3mm 细长条（内层，向内侧偏置 ${mat.bladeOffsetMm}mm）：${tinyMsg}｜仍输出 ${tinyRuns} 段原路径`,
+    ),
+  )
+
+  // ---------- 10. 层级判定：存疑标记 + 人工改判 + 指纹留痕 ----------
+  const sq = (x: number, y: number, w: number, h: number): Pt[] => [
+    { x, y },
+    { x: x + w, y },
+    { x: x + w, y: y + h },
+    { x, y: y + h },
+  ]
+  const nc = (id: string, pts: Pt[], closed = true): Shape['contours'][number] => ({
+    id,
+    points: pts,
+    closed,
+    area: closed ? polygonArea(pts) : 0,
+    length: polylineLength(pts, closed),
+    holes: [],
+    bridges: [],
+    warnings: [],
+  })
+
+  // 10a. 存疑标记：贴边（0.15mm）/ 面积接近（比值 0.81）/ 代表点贴边（0.6mm 细条）
+  const touchA = nc('t_a', sq(0, 0, 50, 50))
+  const touchB = nc('t_b', sq(50.15, 0, 50, 50))
+  const touchTree = buildContainmentTree([touchA, touchB])
+  const touchFlagged = touchTree.uncertainCount >= 2
+  const touchGap = polygonGap(touchA.points, touchB.points, true, true)
+
+  const closeBig = nc('c_big', sq(0, 0, 100, 100))
+  const closeNear = nc('c_near', sq(1, 1, 90, 90))
+  const closeTree = buildContainmentTree([closeBig, closeNear])
+  const areaCloseFlag = closeTree.info.get('c_near')?.flags.includes('area_close') ?? false
+
+  const thin = nc('thin', sq(0, 0, 100, 0.6))
+  const thinTree = buildContainmentTree([thin])
+  const repEdgeFlag = thinTree.info.get('thin')?.flags.includes('rep_near_edge') ?? false
+
+  checks.push(
+    ok(
+      'nesting-uncertain',
+      '层级自动判定的拿不准场景全部标出（贴边 / 面积接近 / 代表点贴边）',
+      touchFlagged && areaCloseFlag && repEdgeFlag,
+      `贴边间隙 ${touchGap.toFixed(2)}mm（< ${BOUNDARY_TOUCH_MM}）标记 ${touchFlagged}｜` +
+        `面积比 ${(8100 / 10000).toFixed(2)}（≥ ${AREA_CLOSE_RATIO}）标记 ${areaCloseFlag}｜` +
+        `细条代表点离边 ${(thinTree.info.get('thin')?.repEdgeMm ?? 0).toFixed(2)}mm（< ${REP_EDGE_MM}）标记 ${repEdgeFlag}`,
+    ),
+  )
+
+  // 10b. 人工改判：mid 强制顶层后，层深 / 净面积 / 刀补方向 / 切割顺序跟着重算
+  const nOuter = nc('n_outer', sq(0, 0, 100, 100))
+  const nMid = nc('n_mid', sq(10, 10, 80, 80))
+  const nCore = nc('n_core', sq(20, 20, 20, 20))
+  const autoNest: Shape = { id: 'st_nest_auto', name: '层级自动', layer: 0, contours: [nOuter, nMid, nCore] }
+  const autoNestComp = computeShape(autoNest, settings, mat)
+  const midFp = contourFingerprint(nMid.points, true)
+  const manualNest: Shape = {
+    id: 'st_nest_manual',
+    name: '层级人工',
+    layer: 0,
+    contours: [nOuter, nMid, nCore].map((x) => ({ ...x })),
+    nesting: { byFp: { [midFp]: { parentFp: null, at: 1234567890 } } },
+  }
+  const manualComp = computeShape(manualNest, { ...settings, useBladeOffset: true }, mat)
+  const autoCompOff = computeShape({ ...autoNest, contours: [nOuter, nMid, nCore].map((x) => ({ ...x })) }, { ...settings, useBladeOffset: true }, mat)
+  const orderSeq = [...new Set(manualComp.order.steps.map((s) => s.contourId))]
+  const innerFirst = orderSeq.indexOf('n_core') < orderSeq.indexOf('n_mid')
+  const netChanged = Math.abs(manualComp.stats.netAreaMm2 - autoNestComp.stats.netAreaMm2) > 1
+  const offsetChanged =
+    JSON.stringify(manualComp.byId.get('n_mid')?.runs) !== JSON.stringify(autoCompOff.byId.get('n_mid')?.runs)
+  const manualMarked = manualComp.tree.info.get('n_mid')?.source === 'manual'
+
+  checks.push(
+    ok(
+      'nesting-manual-recompute',
+      '人工改判为顶层后：层深 / 净面积 / 刀补方向 / 切割顺序全部重算，并留人工标记',
+      manualComp.tree.depthOf.get('n_mid') === 1 && netChanged && offsetChanged && innerFirst && manualMarked,
+      `mid 层深 2→${manualComp.tree.depthOf.get('n_mid')}｜净面积 ${autoNestComp.stats.netAreaMm2.toFixed(0)}→${manualComp.stats.netAreaMm2.toFixed(0)}mm²｜` +
+        `刀补路径改变 ${offsetChanged}｜切序 ${orderSeq.join('→')}（内层仍在前）｜人工标记 ${manualMarked}`,
+    ),
+  )
+
+  // 10c. 指纹留痕：全新对象（新 id + 0.003mm 噪声）按指纹仍认回人工判定
+  const reMidPts = sq(10.002, 9.998, 80, 80)
+  const reimported: Shape = {
+    id: 'st_nest_re',
+    name: '同图重导入',
+    layer: 0,
+    contours: [
+      nc('re_outer', sq(0, 0, 100, 100)),
+      nc('re_mid', reMidPts),
+      nc('re_core', sq(20, 20, 20, 20)),
+    ],
+    nesting: { byFp: { [midFp]: { parentFp: null, at: 1234567890 } } },
+  }
+  const reFpSame = contourFingerprint(reMidPts, true) === midFp
+  const reComp = computeShape(reimported, settings, mat)
+
+  checks.push(
+    ok(
+      'nesting-fingerprint-persist',
+      '人工判定按几何指纹留痕：重新导入同一份图（新 id、亚毫米噪声）仍认回',
+      reFpSame && reComp.tree.depthOf.get('re_mid') === 1 && reComp.stats.nestingManual === 1,
+      `重导入指纹一致 ${reFpSame}｜re_mid 层深 ${reComp.tree.depthOf.get('re_mid')}｜人工判定 ${reComp.stats.nestingManual} 处`,
+    ),
+  )
+
+  // 10d. 成环防御：把外层挂到自己内层下不会死循环，环被断开当顶层
+  const cycleShape: Shape = {
+    id: 'st_nest_cycle',
+    name: '成环防御',
+    layer: 0,
+    contours: [nOuter, nMid, nCore].map((x) => ({ ...x })),
+    nesting: { byFp: { [contourFingerprint(nOuter.points, true)]: { parentFp: contourFingerprint(nCore.points, true), at: 1 } } },
+  }
+  const cycleComp = computeShape(cycleShape, settings, mat)
+  checks.push(
+    ok(
+      'nesting-cycle-guard',
+      '人工指定形成父子环时断开该边（顶层），不死循环、不产出错误深度',
+      cycleComp.tree.info.get('n_outer')?.parentId === null && cycleComp.stats.maxDepth >= 1,
+      `outer 父级 = ${cycleComp.tree.info.get('n_outer')?.parentId ?? 'null（顶层）'}｜maxDepth ${cycleComp.stats.maxDepth}`,
     ),
   )
 

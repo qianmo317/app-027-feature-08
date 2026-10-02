@@ -34,6 +34,10 @@ export type ComputedShape = {
     fragmentCount: number
     cappedBridgeCount: number
     maxDepth: number
+    /** 自动判定拿不准的轮廓数（面积接近/贴边/代表点贴边等） */
+    nestingUncertain: number
+    /** 人工指定层级的轮廓数 */
+    nestingManual: number
     netAreaMm2: number
     bbox: Bounds
     geometryDeviationMm: number
@@ -45,7 +49,7 @@ export type ComputedShape = {
   signature: string
 }
 
-/** 几何签名：用于缓存失效判断（点坐标和 / 点数 / 参数） */
+/** 几何签名：用于缓存失效判断（点坐标和 / 点数 / 参数 / 人工层级判定） */
 export function shapeSignature(shape: Shape, settings: CutSettings, material: MaterialPreset | null): string {
   let h = 0
   let n = 0
@@ -57,12 +61,19 @@ export function shapeSignature(shape: Shape, settings: CutSettings, material: Ma
     // 手工连刀点也参与签名
     for (const b of c.bridges) h = (h + b.atIndex * 1.7 + b.widthMm * 11.3) % 1e9
   }
+  // 人工层级覆盖（按轮廓指纹指定父级）
+  const nestingKeys = shape.nesting ? Object.keys(shape.nesting.byFp).sort() : []
+  for (const k of nestingKeys) {
+    const m = shape.nesting!.byFp[k]
+    h = (h + k.length * 1.3 + (m.parentFp ? m.parentFp.length : 3)) % 1e9
+  }
   return [
     shape.id,
     shape.layer,
     shape.contours.length,
     n,
     Math.round(h * 1000),
+    nestingKeys.length,
     settings.bridgeRule,
     settings.areaThresholdMm2,
     settings.bridgeWidthMm,
@@ -120,7 +131,7 @@ export function computeShape(
   start: Pt = { x: 0, y: 0 },
 ): ComputedShape {
   const t0 = performance.now()
-  const tree = buildContainmentTree(shape.contours)
+  const tree = buildContainmentTree(shape.contours, shape.nesting)
 
   const byId = new Map<string, ComputedContour>()
   const runsOf = new Map<string, CutRun[]>()
@@ -241,6 +252,8 @@ export function computeShape(
       fragmentCount,
       cappedBridgeCount,
       maxDepth: tree.maxDepth,
+      nestingUncertain: tree.uncertainCount,
+      nestingManual: tree.manualCount,
       netAreaMm2,
       bbox,
       geometryDeviationMm,

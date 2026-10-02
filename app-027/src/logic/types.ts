@@ -27,7 +27,30 @@ export type Contour = {
   warnings: ContourWarning[]
 }
 
-export type Shape = { id: string; name: string; contours: Contour[]; layer: number }
+/** 一条人工层级判定（几何自动判不准时由用户指定） */
+export type NestingManual = {
+  /** 指定的父轮廓指纹；null = 强制顶层 */
+  parentFp: string | null
+  /** 修改时间戳（留痕用） */
+  at: number
+}
+
+/**
+ * 形状的人工层级覆盖表：轮廓指纹 → 判定。
+ * 用指纹（与点序/朝向无关的几何哈希）做键，重新导入同一份图也能认回。
+ */
+export type NestingOverrides = {
+  byFp: Record<string, NestingManual>
+}
+
+export type Shape = {
+  id: string
+  name: string
+  contours: Contour[]
+  layer: number
+  /** 人工层级判定（缺省 = 全部自动） */
+  nesting?: NestingOverrides
+}
 
 export type MaterialPreset = {
   id: string

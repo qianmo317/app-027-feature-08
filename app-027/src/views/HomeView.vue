@@ -78,9 +78,12 @@ async function onFiles(files: FileList | null): Promise<void> {
   }
   if (shapes.length === 0) return
   const projectName = shapes.length === 1 ? shapes[0].name : `导入 ${shapes.length} 个纹样`
-  const project = store.createProjectFromShapes(projectName, shapes)
+  const project = store.createProjectFromShapes(projectName, [])
+  const carried = store.addImportedShapes(project, shapes)
   importedSummary.value = summary
-  notice.value = `已导入 ${shapes.length} 个文件，共 ${summary.reduce((a, s) => a + s.kept, 0)} 条轮廓`
+  notice.value =
+    `已导入 ${shapes.length} 个文件，共 ${summary.reduce((a, s) => a + s.kept, 0)} 条轮廓` +
+    (carried > 0 ? `｜已继承 ${carried} 处人工层级判定` : '')
   await router.push(`/design/${project.id}`)
 }
 

@@ -14,8 +14,9 @@ import {
 } from './types'
 import { computeShape, shapeSignature, type ComputedShape } from './pipeline'
 import { buildBatchShape, buildJob, type Job } from './job'
-import { uid } from './geometry'
+import { contourFingerprint, interiorPoint, pointInPolygon, uid } from './geometry'
 import { importSvgText, type ImportResult } from './importer'
+import type { NestingOverrides } from './types'
 import { defaultMaterials } from '@/data/materials'
 
 const LS_KEY = 'papercut-plotter-studio/v1'
@@ -95,6 +96,16 @@ export function scheduleSave(): void {
   }, 250)
 }
 
+function sanitizeNesting(n: Shape['nesting']): NestingOverrides | undefined {
+  if (!n || typeof n !== 'object' || !n.byFp) return undefined
+  const byFp: NestingOverrides['byFp'] = {}
+  for (const [fp, m] of Object.entries(n.byFp)) {
+    if (!m || typeof m.at !== 'number') continue
+    byFp[fp] = { parentFp: m.parentFp ?? null, at: m.at }
+  }
+  return Object.keys(byFp).length > 0 ? { byFp } : undefined
+}
+
 function normalizeProject(p: Project): Project {
   return {
     ...p,
@@ -104,6 +115,7 @@ function normalizeProject(p: Project): Project {
     shapes: (p.shapes ?? []).map((s) => ({
       ...s,
       contours: (s.contours ?? []).map((c) => ({ ...c, holes: c.holes ?? [], bridges: c.bridges ?? [], warnings: c.warnings ?? [] })),
+      nesting: sanitizeNesting(s.nesting),
     })),
     layerNames: p.layerNames ?? ['图层 1'],
   }
@@ -235,14 +247,17 @@ export function duplicateProject(id: string): Project | null {
   copy.name = `${src.name} 副本`
   copy.createdAt = Date.now()
   copy.updatedAt = Date.now()
-  // 重新分配 id，避免缓存串用
+  // 重新分配 id，避免缓存串用；层级人工判定按几何指纹在副本内重建
   for (const s of copy.shapes) {
     s.id = uid('s')
-    for (const c of s.contours) c.id = uid('c')
+    const idByFp = new Map<string, string>()
     for (const c of s.contours) {
+      c.id = uid('c')
       c.holes = []
       c.bridges = []
+      idByFp.set(contourFingerprint(c.points, c.closed), c.id)
     }
+    if (s.nesting) s.nesting = sanitizeNesting(s.nesting)
   }
   state.projects.unshift(copy)
   recomputeProject(copy, true)
@@ -370,6 +385,151 @@ export function clearManualBridges(p: Project, contourId?: string): void {
   touch(p)
 }
 
+// ---------------- 层级人工判定 ----------------
+
+function findContour(p: Project, contourId: string): { shape: Shape; contour: Shape['contours'][number] } | null {
+  for (const shape of p.shapes) {
+    const contour = shape.contours.find((c) => c.id === contourId)
+    if (contour) return { shape, contour }
+  }
+  return null
+}
+
+function ensureNesting(shape: Shape): NestingOverrides {
+  if (!shape.nesting) shape.nesting = { byFp: {} }
+  return shape.nesting
+}
+
+/** 不允许的指定：把祖先挂到自己子孙下（成环） */
+export function canSetParent(p: Project, contourId: string, parentId: string | null): boolean {
+  if (parentId === null) return true
+  if (parentId === contourId) return false
+  // 沿当前生效的父链从 parentId 向上走，遇到 contourId 即成环
+  let cur: string | null = parentId
+  const seen = new Set<string>()
+  while (cur && !seen.has(cur)) {
+    seen.add(cur)
+    if (cur === contourId) return false
+    const curId: string = cur
+    let next: string | null = null
+    for (const s of p.shapes) {
+      const tree = computedOf(s.id)?.tree
+      const pid: string | null | undefined = tree?.nodeById.get(curId)?.parentId
+      if (tree && pid !== undefined) {
+        next = pid
+        break
+      }
+    }
+    cur = next
+  }
+  return true
+}
+
+/** 子轮廓代表点是否落在父轮廓内（重导入继承时区分同指纹的多个副本） */
+function pointInsideLazy(child: Shape['contours'][number], parent: Shape['contours'][number]): boolean {
+  if (!child.closed || !parent.closed) return false
+  return pointInPolygon(interiorPoint(child.points), parent.points)
+}
+
+/**
+ * 手工指定层级：把 contourId 设为 parentId 的直接下一层；parentId=null 改为顶层。
+ * 判定按几何指纹记录（重新导入同一份图仍生效）。
+ */
+export function setContourParent(p: Project, contourId: string, parentId: string | null): boolean {
+  const hit = findContour(p, contourId)
+  if (!hit) return false
+  if (parentId !== null && !findContour(p, parentId)) return false
+  if (!canSetParent(p, contourId, parentId)) return false
+  const { shape, contour } = hit
+  const nesting = ensureNesting(shape)
+  const childFp = contourFingerprint(contour.points, contour.closed)
+  if (parentId === null) {
+    nesting.byFp[childFp] = { parentFp: null, at: Date.now() }
+  } else {
+    const parent = findContour(p, parentId)!.contour
+    if (contourFingerprint(parent.points, parent.closed) === childFp) return false
+    nesting.byFp[childFp] = {
+      parentFp: contourFingerprint(parent.points, parent.closed),
+      at: Date.now(),
+    }
+  }
+  recomputeProject(p, true)
+  touch(p)
+  return true
+}
+
+/** 撤销单条人工判定，恢复自动 */
+export function resetContourNesting(p: Project, contourId: string): void {
+  const hit = findContour(p, contourId)
+  if (!hit?.shape.nesting) return
+  const fp = contourFingerprint(hit.contour.points, hit.contour.closed)
+  if (fp in hit.shape.nesting.byFp) {
+    delete hit.shape.nesting.byFp[fp]
+    recomputeProject(p, true)
+    touch(p)
+  }
+}
+
+/** 清空当前形状（或整个项目）的人工层级判定 */
+export function resetAllNesting(p: Project, shapeId?: string): void {
+  let changed = false
+  for (const s of p.shapes) {
+    if (shapeId && s.id !== shapeId) continue
+    if (s.nesting && Object.keys(s.nesting.byFp).length > 0) {
+      s.nesting = { byFp: {} }
+      changed = true
+    }
+  }
+  if (changed) {
+    recomputeProject(p, true)
+    touch(p)
+  }
+}
+
+/**
+ * 重新导入同一份图后继承人工判定：
+ * 在项目已有的全部形状里按几何指纹找「子轮廓 → 指定父轮廓」，
+ * 父子指纹都在新形状中出现才继承；子同指纹有多个时取代表点落在指定父内的那个。
+ * 返回继承的判定条数。
+ */
+export function carryNestingOverrides(p: Project, shape: Shape): number {
+  const oldEntries: Array<{ childFp: string; parentFp: string | null; at: number }> = []
+  for (const s of p.shapes) {
+    if (!s.nesting) continue
+    for (const [fp, m] of Object.entries(s.nesting.byFp)) {
+      oldEntries.push({ childFp: fp, parentFp: m.parentFp, at: m.at })
+    }
+  }
+  if (oldEntries.length === 0) return 0
+
+  const newItems = shape.contours.map((c) => ({
+    c,
+    fp: contourFingerprint(c.points, c.closed),
+  }))
+  const newFps = new Set(newItems.map((x) => x.fp))
+  const nesting = ensureNesting(shape)
+  let carried = 0
+  for (const e of oldEntries) {
+    if (!newFps.has(e.childFp)) continue
+    if (e.parentFp !== null && !newFps.has(e.parentFp)) continue
+    const children = newItems.filter((x) => x.fp === e.childFp)
+    let chosen = children[0]
+    if (children.length > 1 && e.parentFp !== null) {
+      // 同指纹多个子（重复/对称）：选代表点落在指定父轮廓内的那个
+      const parents = newItems.filter((x) => x.fp === e.parentFp)
+      const inside = children.find((ch) =>
+        parents.some((par) => ch.c.closed && pointInsideLazy(ch.c, par.c)),
+      )
+      if (inside) chosen = inside
+    }
+    if (!chosen) continue
+    nesting.byFp[e.childFp] = { parentFp: e.parentFp, at: e.at }
+    carried += 1
+  }
+  if (Object.keys(nesting.byFp).length === 0) shape.nesting = undefined
+  return carried
+}
+
 /** 纹样对称生成：镜像 / 旋转 / 四方连续 */
 export function applySymmetry(p: Project, shapeId: string, op: 'mirror_x' | 'mirror_y' | 'rotate_90' | 'rotate_180' | 'four_way'): void {
   const shape = p.shapes.find((s) => s.id === shapeId)
@@ -444,10 +604,15 @@ export function importSvgToShapes(
   return { result, shape }
 }
 
-export function addImportedShapes(p: Project, shapes: Shape[]): void {
-  for (const s of shapes) p.shapes.push(s)
+export function addImportedShapes(p: Project, shapes: Shape[]): number {
+  let carried = 0
+  for (const s of shapes) {
+    carried += carryNestingOverrides(p, s)
+    p.shapes.push(s)
+  }
   recomputeProject(p, true)
   touch(p)
+  return carried
 }
 
 watch(
@@ -485,6 +650,11 @@ export const store = {
   removeContour,
   placeManualBridge,
   clearManualBridges,
+  setContourParent,
+  resetContourNesting,
+  resetAllNesting,
+  canSetParent,
+  carryNestingOverrides,
   applySymmetry,
   upsertMaterial,
   deleteMaterial,

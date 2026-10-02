@@ -424,3 +424,189 @@ export function uid(prefix = 'id'): string {
 export function bboxOverlaps(a: Bounds, b: Bounds, eps = 1e-6): boolean {
   return !(a.maxX < b.minX - eps || b.maxX < a.minX - eps || a.maxY < b.minY - eps || b.maxY < a.minY - eps)
 }
+
+/**
+ * 轮廓几何指纹：与起点、点序方向（顺/逆时针）无关，坐标按 0.01mm 取整。
+ * 同一份 SVG 重新导入（相同离散容差）会得到相同指纹，人工层级判定据此留痕。
+ * 摘要 = 点数 + 边长多重集 + 边点对（双 32 位 FNV，降低碰撞）。
+ */
+export function contourFingerprint(points: Pt[], closed: boolean): string {
+  const Q = 0.01
+  const q = (v: number) => Math.round(v / Q)
+  const n = points.length
+  const edgeCount = closed ? n : Math.max(0, n - 1)
+
+  // 边长多重集（与起点/方向无关）：量化长度 + 长度²
+  let h1 = 2166136261
+  let h2 = 5381
+  const lens: number[] = []
+  let sumL = 0
+  let sumL2 = 0
+  for (let i = 0; i < edgeCount; i++) {
+    const a = points[i]
+    const b = points[(i + 1) % n]
+    const dx = q(b.x) - q(a.x)
+    const dy = q(b.y) - q(a.y)
+    const l2 = dx * dx + dy * dy
+    const l = Math.round(Math.sqrt(l2) / Q)
+    lens.push(l)
+    sumL += l
+    sumL2 += l2
+  }
+  lens.sort((a, b) => a - b)
+  const mix = (h: number, v: number) => {
+    let x = (h ^ Math.imul(v, 2654435761)) >>> 0
+    x = Math.imul(x ^ (x >>> 13), 1274126177) >>> 0
+    return (x ^ (x >>> 16)) >>> 0
+  }
+  h1 = mix(h1, n)
+  h2 = mix(h2, n * 7 + (closed ? 1 : 0))
+  h1 = mix(h1, sumL)
+  h2 = mix(h2, sumL2)
+  for (const l of lens) {
+    h1 = mix(h1, l)
+    h2 = mix(h2, l + 3)
+  }
+  // 边点对：每条边的量化端点对（无序、与方向无关），同一组边不同拼接方式也能区分
+  const edgeKeys: number[] = []
+  for (let i = 0; i < edgeCount; i++) {
+    const a = points[i]
+    const b = points[(i + 1) % n]
+    const ax = q(a.x)
+    const ay = q(a.y)
+    const bx = q(b.x)
+    const by = q(b.y)
+    const u = Math.imul(ax, 73856093) ^ Math.imul(ay, 19349663)
+    const v = Math.imul(bx, 73856093) ^ Math.imul(by, 19349663)
+    edgeKeys.push(u < v ? u ^ Math.imul(v, 83492791) : v ^ Math.imul(u, 83492791))
+  }
+  edgeKeys.sort((a, b) => a - b)
+  for (const k of edgeKeys) {
+    h1 = mix(h1, k)
+    h2 = mix(h2, k ^ 0x9e3779b9)
+  }
+  return `${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0).toString(16).padStart(8, '0')}`
+}
+
+/** 点到线段的距离 */
+export function pointSegmentDistance(p: Pt, a: Pt, b: Pt): number {
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+  const l2 = dx * dx + dy * dy
+  let t = l2 > 0 ? ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2 : 0
+  t = Math.max(0, Math.min(1, t))
+  return Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t))
+}
+
+type GridSeg = { a: Pt; b: Pt }
+
+function bSegs(pts: Pt[], closed: boolean): GridSeg[] {
+  const out: GridSeg[] = []
+  const n = pts.length
+  const m = closed ? n : n - 1
+  for (let i = 0; i < m; i++) out.push({ a: pts[i], b: pts[(i + 1) % n] })
+  return out
+}
+
+export type SegNearestTree = {
+  /** 点到该轮廓边的最近距离；upperBound 为当前已知上界时可提前剪枝 */
+  nearest: (p: Pt, upperBound?: number) => number
+  segCount: number
+}
+
+/** 为一组边建线段 BVH（2D 最近点查询 ~O(log n)，按包围盒下界剪枝） */
+export function buildSegNearestTree(points: Pt[], closed: boolean): SegNearestTree {
+  const segs = bSegs(points, closed)
+  type Node = { minX: number; minY: number; maxX: number; maxY: number; left?: Node | null; right?: Node | null; seg?: GridSeg }
+  const segBounds = (s: GridSeg) => ({
+    minX: Math.min(s.a.x, s.b.x),
+    minY: Math.min(s.a.y, s.b.y),
+    maxX: Math.max(s.a.x, s.b.x),
+    maxY: Math.max(s.a.y, s.b.y),
+  })
+  const build = (list: GridSeg[]): Node | null => {
+    if (list.length === 0) return null
+    if (list.length === 1) return { ...segBounds(list[0]), seg: list[0] }
+    let minX = Infinity
+    let minY = Infinity
+    let maxX = -Infinity
+    let maxY = -Infinity
+    for (const s of list) {
+      const b = segBounds(s)
+      minX = Math.min(minX, b.minX)
+      minY = Math.min(minY, b.minY)
+      maxX = Math.max(maxX, b.maxX)
+      maxY = Math.max(maxY, b.maxY)
+    }
+    // 沿较长轴按中点排序二分
+    const axis = maxX - minX >= maxY - minY ? 'x' : 'y'
+    const sorted = list.slice()
+    if (axis === 'x') sorted.sort((u, v) => (u.a.x + u.b.x) / 2 - (v.a.x + v.b.x) / 2)
+    else sorted.sort((u, v) => (u.a.y + u.b.y) / 2 - (v.a.y + v.b.y) / 2)
+    const mid = sorted.length >> 1
+    return { minX, minY, maxX, maxY, left: build(sorted.slice(0, mid)), right: build(sorted.slice(mid)) }
+  }
+  const root = build(segs)
+  const boxDist = (n: Node, p: Pt): number => {
+    const dx = Math.max(n.minX - p.x, 0, p.x - n.maxX)
+    const dy = Math.max(n.minY - p.y, 0, p.y - n.maxY)
+    return Math.hypot(dx, dy)
+  }
+  const nearest = (p: Pt, upperBound = Infinity): number => {
+    if (!root) return Infinity
+    let best = upperBound
+    const stack: Node[] = [root]
+    while (stack.length > 0) {
+      const n = stack.pop() as Node
+      if (boxDist(n, p) >= best) continue
+      if (n.seg) {
+        best = Math.min(best, pointSegmentDistance(p, n.seg.a, n.seg.b))
+      } else {
+        const l = n.left
+        const r = n.right
+        if (l && r) {
+          // 先探离点更近的子树
+          if (boxDist(l, p) <= boxDist(r, p)) {
+            stack.push(r)
+            stack.push(l)
+          } else {
+            stack.push(l)
+            stack.push(r)
+          }
+        } else if (l) stack.push(l)
+        else if (r) stack.push(r)
+      }
+    }
+    return best
+  }
+  return { nearest, segCount: segs.length }
+}
+
+/**
+ * 两条折线之间的最小边界间距（mm，线段 BVH 加速）。
+ * 纯几何距离（最近点必为顶点到对边的投影）：
+ * 嵌套时有正常正间距（内框到外框的余量），贴边/相交时为 0。
+ * treeB/treeA 可由调用方复用，避免同一轮廓的 BVH 被重复构建。
+ */
+export function polygonGapBvh(
+  a: Pt[],
+  b: Pt[],
+  aClosed: boolean,
+  bClosed: boolean,
+  treeB?: SegNearestTree,
+  treeA?: SegNearestTree,
+): number {
+  if (a.length < 2 || b.length < 2) return Infinity
+  const tb = treeB ?? buildSegNearestTree(b, bClosed)
+  let best = Infinity
+  for (const p of a) best = Math.min(best, tb.nearest(p, best))
+  if (best < 1e-9) return 0
+  const ta = treeA ?? buildSegNearestTree(a, aClosed)
+  for (const p of b) best = Math.min(best, ta.nearest(p, best))
+  return best
+}
+
+/** 不预建 BVH 的便捷封装（偶发查询用；批量请用 buildSegNearestTree 复用） */
+export function polygonGap(a: Pt[], b: Pt[], aClosed: boolean, bClosed: boolean): number {
+  return polygonGapBvh(a, b, aClosed, bClosed)
+}
