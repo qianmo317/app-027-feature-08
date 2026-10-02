@@ -329,6 +329,42 @@ const outlineContours = computed<DrawContour[]>(() => {
 
 const pl = (p: Pt): Pt => (props.placement ? placePoint(p, props.placement) : p)
 
+/** 包含关系判定标记：拿不准 / 人工 / 失效人工，以及人工父子连线 */
+const nestingMarkers = computed(() => {
+  const markers: Array<{ x: number; y: number; kind: 'doubt' | 'manual' | 'manualBad'; contourId: string }> = []
+  const links: Array<{ x1: number; y1: number; x2: number; y2: number }> = []
+  for (const s of props.shapes) {
+    const comp = props.computed.get(s.id)
+    if (!comp) continue
+    for (const info of comp.tree.infoById.values()) {
+      if (!info.rep) continue
+      const rp = pl(info.rep)
+      if (info.manualIssue) markers.push({ x: rp.x, y: rp.y, kind: 'manualBad', contourId: info.id })
+      else if (info.manual) markers.push({ x: rp.x, y: rp.y, kind: 'manual', contourId: info.id })
+      else if (info.doubts.length > 0) markers.push({ x: rp.x, y: rp.y, kind: 'doubt', contourId: info.id })
+      if (info.manual && info.parentId) {
+        const pInfo = comp.tree.infoById.get(info.parentId)
+        if (pInfo?.rep) {
+          const pp = pl(pInfo.rep)
+          links.push({ x1: rp.x, y1: rp.y, x2: pp.x, y2: pp.y })
+        }
+      }
+    }
+  }
+  return { markers, links }
+})
+
+/** 选中轮廓的判定代表点 */
+const selectedRep = computed<{ x: number; y: number } | null>(() => {
+  if (!props.selectedContourId) return null
+  for (const s of props.shapes) {
+    const comp = props.computed.get(s.id)
+    const info = comp?.tree.infoById.get(props.selectedContourId)
+    if (info?.rep) return pl(info.rep)
+  }
+  return null
+})
+
 const cutSteps = computed<CutStep[]>(() => {
   if (props.job) return props.job.steps
   const out: CutStep[] = []
@@ -566,6 +602,34 @@ function focusContour(id: string): void {
               {{ n.i }}
             </text>
           </g>
+        </g>
+
+        <!-- 包含关系判定标记：拿不准（琥珀菱形）/ 人工（蓝方块）/ 失效人工（红方块） -->
+        <g v-if="mode === 'outline' || mode === 'toolpath'">
+          <g stroke="#5aa9ff" stroke-width="0.6" stroke-dasharray="2 1.6" opacity="0.75">
+            <line v-for="(lnk, i) in nestingMarkers.links" :key="`nl${i}`" :x1="lnk.x1" :y1="lnk.y1" :x2="lnk.x2" :y2="lnk.y2" />
+          </g>
+          <g v-for="(m, i) in nestingMarkers.markers" :key="`nm${i}`">
+            <rect
+              v-if="m.kind !== 'doubt'"
+              :x="m.x - 1.5 / zoom"
+              :y="m.y - 1.5 / zoom"
+              :width="3 / zoom"
+              :height="3 / zoom"
+              :fill="m.kind === 'manualBad' ? '#ff6b6b' : '#5aa9ff'"
+              :stroke="m.contourId === selectedContourId ? '#fff' : 'none'"
+              :stroke-width="0.6 / zoom"
+              :transform="`rotate(45 ${m.x} ${m.y})`"
+            />
+            <polygon
+              v-else
+              :points="`${m.x},${m.y - 2 / zoom} ${m.x + 2 / zoom},${m.y} ${m.x},${m.y + 2 / zoom} ${m.x - 2 / zoom},${m.y}`"
+              fill="#ffc857"
+              :stroke="m.contourId === selectedContourId ? '#fff' : 'none'"
+              :stroke-width="0.6 / zoom"
+            />
+          </g>
+          <circle v-if="selectedRep" :cx="selectedRep.x" :cy="selectedRep.y" :r="1.4 / zoom" fill="none" stroke="#47c07a" :stroke-width="1 / zoom" />
         </g>
 
         <!-- 连刀点缺口标记 -->

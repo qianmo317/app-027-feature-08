@@ -80,7 +80,11 @@ async function onFiles(files: FileList | null): Promise<void> {
   const projectName = shapes.length === 1 ? shapes[0].name : `导入 ${shapes.length} 个纹样`
   const project = store.createProjectFromShapes(projectName, shapes)
   importedSummary.value = summary
-  notice.value = `已导入 ${shapes.length} 个文件，共 ${summary.reduce((a, s) => a + s.kept, 0)} 条轮廓`
+  // 重新导入同一张图时，按几何指纹恢复的人工判定条数
+  const restoredTotal = project.shapes.reduce((n, s) => n + store.manualParentCount(s), 0)
+  notice.value =
+    `已导入 ${shapes.length} 个文件，共 ${summary.reduce((a, s) => a + s.kept, 0)} 条轮廓` +
+    (restoredTotal > 0 ? `｜已按图样指纹恢复 ${restoredTotal} 处人工父子判定（编辑页蓝色 ■ 标记）` : '')
   await router.push(`/design/${project.id}`)
 }
 

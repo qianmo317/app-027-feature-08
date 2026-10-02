@@ -424,3 +424,152 @@ export function uid(prefix = 'id'): string {
 export function bboxOverlaps(a: Bounds, b: Bounds, eps = 1e-6): boolean {
   return !(a.maxX < b.minX - eps || b.maxX < a.minX - eps || a.maxY < b.minY - eps || b.maxY < a.minY - eps)
 }
+
+/** 点到线段的距离 */
+export function pointSegDist(p: Pt, a: Pt, b: Pt): number {
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+  const l2 = dx * dx + dy * dy
+  let t = l2 > 0 ? ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2 : 0
+  t = Math.max(0, Math.min(1, t))
+  return Math.hypot(p.x - (a.x + dx * t), p.y - (a.y + dy * t))
+}
+
+function orient2(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+  return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+}
+
+/** 两条线段之间的距离（相交/接触返回 0） */
+export function segSegDist(p1: Pt, p2: Pt, p3: Pt, p4: Pt): number {
+  const d1 = orient2(p1.x, p1.y, p3.x, p3.y, p4.x, p4.y)
+  const d2 = orient2(p2.x, p2.y, p3.x, p3.y, p4.x, p4.y)
+  const d3 = orient2(p3.x, p3.y, p1.x, p1.y, p2.x, p2.y)
+  const d4 = orient2(p4.x, p4.y, p1.x, p1.y, p2.x, p2.y)
+  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return 0
+  return Math.min(pointSegDist(p1, p3, p4), pointSegDist(p2, p3, p4), pointSegDist(p3, p1, p2), pointSegDist(p4, p1, p2))
+}
+
+export type GapGroup = { id: string; pts: Pt[]; closed: boolean }
+export type GapPair = { otherId: string; gap: number; otherClosed: boolean }
+
+type GridSeg = { owner: string; a: Pt; b: Pt; index: number }
+
+/** 线段实际穿过的网格格（Amanatides-Woo 体素遍历），再向外膨胀 dilate 格 */
+function segmentCells(x0: number, y0: number, x1: number, y1: number, cell: number, dilate: number): Array<[number, number]> {
+  let cx = Math.floor(x0 / cell)
+  let cy = Math.floor(y0 / cell)
+  const ex = Math.floor(x1 / cell)
+  const ey = Math.floor(y1 / cell)
+  const dx = x1 - x0
+  const dy = y1 - y0
+  const stepX = dx > 0 ? 1 : dx < 0 ? -1 : 0
+  const stepY = dy > 0 ? 1 : dy < 0 ? -1 : 0
+  // 到下一条格线的参数 t（0..1）
+  const bound = (p: number, step: number): number => {
+    if (step === 0) return Infinity
+    const next = (Math.floor(p / cell) + (step > 0 ? 1 : 0)) * cell
+    return step > 0 ? next - p : p - next
+  }
+  let tMaxX = dx !== 0 ? bound(x0, stepX) / Math.abs(dx) : Infinity
+  let tMaxY = dy !== 0 ? bound(y0, stepY) / Math.abs(dy) : Infinity
+  const tDeltaX = dx !== 0 ? cell / Math.abs(dx) : Infinity
+  const tDeltaY = dy !== 0 ? cell / Math.abs(dy) : Infinity
+  const cells: Array<[number, number]> = [[cx, cy]]
+  let guard = 0
+  while ((cx !== ex || cy !== ey) && guard++ < 100000) {
+    if (tMaxX < tMaxY) {
+      cx += stepX
+      tMaxX += tDeltaX
+    } else {
+      cy += stepY
+      tMaxY += tDeltaY
+    }
+    cells.push([cx, cy])
+  }
+  if (dilate === 0) return cells
+  const set = new Set<number>()
+  const out: Array<[number, number]> = []
+  for (const [x, y] of cells) {
+    for (let ox = -dilate; ox <= dilate; ox++) {
+      for (let oy = -dilate; oy <= dilate; oy++) {
+        const k = (x + ox) * 100003 + (y + oy)
+        if (!set.has(k)) {
+          set.add(k)
+          out.push([x + ox, y + oy])
+        }
+      }
+    }
+  }
+  return out
+}
+
+/**
+ * 全组折线两两的「间距 ≤ maxGap」邻近对，空间网格加速（近似线性）。
+ * 同一条组内的线段不参与；结果按组 id 索引，gap 为最小间距（接触/相交为 0）。
+ */
+export function nearbyGapPairs(groups: GapGroup[], maxGap: number): Map<string, GapPair[]> {
+  const result = new Map<string, Map<string, GapPair>>()
+  if (!(maxGap > 0) || groups.length === 0) return new Map()
+  const cell = maxGap
+  const key = (cx: number, cy: number) => cy * 100003 + cx
+  const grid = new Map<number, GridSeg[]>()
+  const put = (cx: number, cy: number, seg: GridSeg): void => {
+    const k = key(cx, cy)
+    const arr = grid.get(k)
+    if (arr) arr.push(seg)
+    else grid.set(k, [seg])
+  }
+  const allSegs: GridSeg[] = []
+  for (const g of groups) {
+    const n = g.pts.length
+    const last = g.closed ? n : n - 1
+    for (let i = 0; i < last; i++) {
+      const a = g.pts[i]
+      const b = g.pts[(i + 1) % n]
+      const seg: GridSeg = { owner: g.id, a, b, index: allSegs.length }
+      allSegs.push(seg)
+      // 只索引线段实际穿过的格；查询方按 ±1 格搜索即可覆盖间距 ≤ cell 的邻近对
+      for (const [cx, cy] of segmentCells(a.x, a.y, b.x, b.y, cell, 0)) put(cx, cy, seg)
+    }
+  }
+  const record = (a: string, b: string, gap: number, bClosed: boolean): void => {
+    let ma = result.get(a)
+    if (!ma) {
+      ma = new Map()
+      result.set(a, ma)
+    }
+    const cur = ma.get(b)
+    if (!cur || gap < cur.gap) ma.set(b, { otherId: b, gap, otherClosed: bClosed })
+  }
+  const closedOf = new Map(groups.map((g) => [g.id, g.closed]))
+  const pairTested = new Set<number>()
+  for (const seg of allSegs) {
+    const { a, b, owner } = seg
+    const x0 = Math.floor(Math.min(a.x, b.x) / cell) - 1
+    const x1 = Math.floor(Math.max(a.x, b.x) / cell) + 1
+    const y0 = Math.floor(Math.min(a.y, b.y) / cell) - 1
+    const y1 = Math.floor(Math.max(a.y, b.y) / cell) + 1
+    const nearby = new Set<GridSeg>()
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cy = y0; cy <= y1; cy++) {
+        for (const other of grid.get(key(cx, cy)) ?? []) nearby.add(other)
+      }
+    }
+    for (const other of nearby) {
+      if (other.owner === owner) continue
+      const lo = Math.min(seg.index, other.index)
+      const hi = Math.max(seg.index, other.index)
+      const pk = lo * 1000003 + hi
+      if (pairTested.has(pk)) continue
+      pairTested.add(pk)
+      const gap = segSegDist(a, b, other.a, other.b)
+      if (gap <= maxGap) {
+        record(owner, other.owner, gap, closedOf.get(other.owner) ?? false)
+        record(other.owner, owner, gap, closedOf.get(owner) ?? false)
+      }
+    }
+  }
+  const out = new Map<string, GapPair[]>()
+  for (const [id, m] of result) out.set(id, [...m.values()])
+  return out
+}

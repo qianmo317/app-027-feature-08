@@ -12,10 +12,18 @@ import {
   type Shape,
   type Sheet,
 } from './types'
-import { computeShape, shapeSignature, type ComputedShape } from './pipeline'
+import { computeShape, manualNestingSignature, shapeSignature, type ComputedShape } from './pipeline'
 import { buildBatchShape, buildJob, type Job } from './job'
 import { uid } from './geometry'
 import { importSvgText, type ImportResult } from './importer'
+import {
+  clearOverride,
+  contourFingerprintMap,
+  overridesForShape,
+  recordOverride,
+  shapeFingerprint,
+} from './identity'
+import { buildContainmentTree, type ManualParentMap } from './nesting'
 import { defaultMaterials } from '@/data/materials'
 
 const LS_KEY = 'papercut-plotter-studio/v1'
@@ -43,6 +51,36 @@ export const state = reactive<StoreState>({
 /** 派生计算结果缓存（按几何签名失效，不持久化） */
 const computedCache = reactive<Record<string, ComputedShape>>({})
 const batchCache = new Map<string, ComputedShape>()
+/** 形状几何指纹缓存：key = shape.id|contourCount|轻量几何哈希 */
+const shapeFpCache = new Map<string, { geoKey: string; shapeFp: string; fps: Map<string, string> }>()
+
+/** 轻量几何 key：轮廓点变了才需要重算指纹 */
+function geoKeyOf(shape: Shape): string {
+  let h = 0
+  let n = 0
+  for (const c of shape.contours) {
+    n += c.points.length
+    for (const p of c.points) h = (h + p.x * 7.13 + p.y * 3.71) % 1e9
+  }
+  return `${shape.contours.length}:${n}:${Math.round(h * 1000)}`
+}
+
+/** 当前形状的指纹与「轮廓 id → 指纹」映射（带缓存） */
+export function shapeIdentity(shape: Shape): { shapeFp: string; fps: Map<string, string> } {
+  const geoKey = geoKeyOf(shape)
+  const cached = shapeFpCache.get(shape.id)
+  if (cached && cached.geoKey === geoKey) return { shapeFp: cached.shapeFp, fps: cached.fps }
+  const fps = contourFingerprintMap(shape.contours)
+  const shapeFp = shapeFingerprint(shape.contours)
+  shapeFpCache.set(shape.id, { geoKey, shapeFp, fps })
+  return { shapeFp, fps }
+}
+
+/** 解析台账中这张形状的人工父子判定（轮廓 id 映射） */
+function manualParentsOf(shape: Shape): ManualParentMap {
+  const { shapeFp, fps } = shapeIdentity(shape)
+  return overridesForShape(shapeFp, fps)
+}
 
 function canUseStorage(): boolean {
   try {
@@ -118,9 +156,11 @@ export function recomputeProject(p: Project, force = false): void {
   const material = materialOf(p)
   for (const shape of p.shapes) {
     const sig = shapeSignature(shape, p.settings, material)
+    const manualParents = manualParentsOf(shape)
+    const mSig = manualNestingSignature(manualParents)
     const cached = computedCache[shape.id]
-    if (!force && cached && cached.signature === sig) continue
-    const res = computeShape(shape, p.settings, material)
+    if (!force && cached && cached.signature === sig && manualNestingSignature(cached.manualParents) === mSig) continue
+    const res = computeShape(shape, p.settings, material, { x: 0, y: 0 }, manualParents)
     applyComputed(shape, res)
     computedCache[shape.id] = res
   }
@@ -153,11 +193,14 @@ export function jobOf(p: Project): { job: Job; shape: Shape | null; isBatch: boo
   if (batch && batch.enabled) {
     const src = p.shapes.find((s) => s.id === p.batchShapeId) ?? p.shapes[0]
     if (src) {
-      const tiled = buildBatchShape(src, batch)
-      const sig = `batch|${shapeSignature(src, p.settings, material)}|${batch.rows}|${batch.cols}|${batch.gapXMm}|${batch.gapYMm}|${batch.mode}`
+      const srcManual = manualParentsOf(src)
+      const { shape: tiled, manualParents: tiledManual } = buildBatchShape(src, batch, srcManual)
+      const sig =
+        `batch|${shapeSignature(src, p.settings, material)}|${manualNestingSignature(srcManual)}` +
+        `|${batch.rows}|${batch.cols}|${batch.gapXMm}|${batch.gapYMm}|${batch.mode}`
       let comp = batchCache.get(sig)
       if (!comp) {
-        comp = computeShape(tiled, p.settings, material, start)
+        comp = computeShape(tiled, p.settings, material, start, tiledManual)
         batchCache.set(sig, comp)
         if (batchCache.size > 24) {
           const firstKey = batchCache.keys().next().value
@@ -266,6 +309,7 @@ export function removeShape(p: Project, shapeId: string): void {
   if (i >= 0) {
     p.shapes.splice(i, 1)
     delete computedCache[shapeId]
+    shapeFpCache.delete(shapeId)
     touch(p)
   }
 }
@@ -370,6 +414,78 @@ export function clearManualBridges(p: Project, contourId?: string): void {
   touch(p)
 }
 
+// ---------------- 包含关系（父子判定）人工覆盖 ----------------
+
+/** 试探：把 contourId 指定为 parentId（null=置顶）会不会成环；返回 null=可行，否则为原因 */
+export function checkManualParent(p: Project, shapeId: string, contourId: string, parentId: string | null): string | null {
+  const shape = p.shapes.find((s) => s.id === shapeId)
+  if (!shape) return '形状不存在'
+  const contour = shape.contours.find((c) => c.id === contourId)
+  if (!contour) return '轮廓不存在'
+  if (!contour.closed) return '未闭合轮廓不参与内外层判定'
+  if (parentId === null) return null
+  if (parentId === contourId) return '不能把自身指定为父级'
+  const parent = shape.contours.find((c) => c.id === parentId)
+  if (!parent) return '父级轮廓不存在'
+  if (!parent.closed) return '未闭合轮廓不能作为父级（外框断裂时请先一键闭合）'
+
+  // 在「当前生效判定 + 本次修改」上做一次试构建，成环时树会拒绝
+  const current = manualParentsOf(shape)
+  const trial = new Map(current)
+  trial.set(contourId, parentId)
+  const result = buildContainmentTree(shape.contours, trial)
+  const info = result.infoById.get(contourId)
+  // 试构建会改写派生值 holes，恢复为当前真实判定
+  buildContainmentTree(shape.contours, current)
+  if (info?.manualIssue) return info.manualIssue
+  return null
+}
+
+/** 指定父级（parentId=null 表示置顶）。校验失败返回 false 并给出原因，不写台账 */
+export function setManualParent(
+  p: Project,
+  shapeId: string,
+  contourId: string,
+  parentId: string | null,
+): { ok: boolean; reason?: string } {
+  const reason = checkManualParent(p, shapeId, contourId, parentId)
+  if (reason) return { ok: false, reason }
+  const shape = p.shapes.find((s) => s.id === shapeId)
+  if (!shape) return { ok: false, reason: '形状不存在' }
+  const { shapeFp, fps } = shapeIdentity(shape)
+  recordOverride(shapeFp, fps, contourId, parentId)
+  recomputeProject(p, true)
+  touch(p)
+  return { ok: true }
+}
+
+/** 恢复自动判定（删除这条人工覆盖） */
+export function resetManualParent(p: Project, shapeId: string, contourId: string): void {
+  const shape = p.shapes.find((s) => s.id === shapeId)
+  if (!shape) return
+  const { shapeFp, fps } = shapeIdentity(shape)
+  clearOverride(shapeFp, fps, contourId)
+  recomputeProject(p, true)
+  touch(p)
+}
+
+/** 清空这个形状的全部人工父子判定，返回清除条数 */
+export function resetAllManualParents(p: Project, shapeId: string): number {
+  const shape = p.shapes.find((s) => s.id === shapeId)
+  if (!shape) return 0
+  const { shapeFp, fps } = shapeIdentity(shape)
+  const before = overridesForShape(shapeFp, fps).size
+  for (const id of fps.keys()) clearOverride(shapeFp, fps, id)
+  recomputeProject(p, true)
+  touch(p)
+  return before
+}
+
+/** 当前形状生效中的人工判定条数（核对表徽标用） */
+export function manualParentCount(shape: Shape): number {
+  return manualParentsOf(shape).size
+}
+
 /** 纹样对称生成：镜像 / 旋转 / 四方连续 */
 export function applySymmetry(p: Project, shapeId: string, op: 'mirror_x' | 'mirror_y' | 'rotate_90' | 'rotate_180' | 'four_way'): void {
   const shape = p.shapes.find((s) => s.id === shapeId)
@@ -444,10 +560,13 @@ export function importSvgToShapes(
   return { result, shape }
 }
 
-export function addImportedShapes(p: Project, shapes: Shape[]): void {
+export function addImportedShapes(p: Project, shapes: Shape[]): { restoredManualNesting: number[] } {
   for (const s of shapes) p.shapes.push(s)
   recomputeProject(p, true)
   touch(p)
+  // 按指纹恢复的人工判定条数（让用户重新导入同一张图时能看到「哪几处是人工定的」）
+  const restoredManualNesting = shapes.map((s) => manualParentsOf(s).size)
+  return { restoredManualNesting }
 }
 
 watch(
@@ -485,6 +604,12 @@ export const store = {
   removeContour,
   placeManualBridge,
   clearManualBridges,
+  checkManualParent,
+  setManualParent,
+  resetManualParent,
+  resetAllManualParents,
+  manualParentCount,
+  shapeIdentity,
   applySymmetry,
   upsertMaterial,
   deleteMaterial,

@@ -3,6 +3,7 @@ import type { ComputedShape } from './pipeline'
 import { dedupeSharedEdges } from './exporters'
 import { makeContour } from './cleanup'
 import { boundsOf, dist } from './geometry'
+import type { ManualParentMap } from './nesting'
 import type { CutStep } from './order'
 
 export type JobStep = CutStep & { shapeId: string; shapeName: string; shapeLayer: number }
@@ -18,11 +19,21 @@ export type Job = {
   shapeOrder: string[]
 }
 
-/** 批量排版：同一纹样在纸上排满（间距可调，间距为 0 时可共边裁切） */
-export function buildBatchShape(shape: Shape, batch: BatchCfg): Shape {
+/**
+ * 批量排版：同一纹样在纸上排满（间距可调，间距为 0 时可共边裁切）。
+ * 返回瓦片形状，以及按瓦片结构复制的人工父子判定（平移 / 镜像的轮廓指纹相同，
+ * 不能靠指纹恢复——直接按「源轮廓 → 新轮廓」的对应关系映射）。
+ */
+export function buildBatchShape(
+  shape: Shape,
+  batch: BatchCfg,
+  sourceManualParents?: ManualParentMap | null,
+): { shape: Shape; manualParents: ManualParentMap } {
   const rows = Math.max(1, Math.round(batch.rows))
   const cols = Math.max(1, Math.round(batch.cols))
-  if (!batch.enabled || (rows === 1 && cols === 1)) return shape
+  if (!batch.enabled || (rows === 1 && cols === 1)) {
+    return { shape, manualParents: new Map(sourceManualParents ?? []) }
+  }
   const all = shape.contours.flatMap((c) => c.points)
   const b = boundsOf(all)
   const w = b.maxX - b.minX
@@ -31,24 +42,40 @@ export function buildBatchShape(shape: Shape, batch: BatchCfg): Shape {
   const stepY = h + Math.max(0, batch.gapYMm)
 
   const contours: Contour[] = []
+  // 每块瓦片：源轮廓 id → 新轮廓 id
+  const tileIdMaps: Array<Map<string, string>> = []
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const mirrorX = batch.mode === 'four_way' && c % 2 === 1
       const mirrorY = batch.mode === 'four_way' && r % 2 === 1
       const ox = b.minX + c * stepX
       const oy = b.minY + r * stepY
+      const idMap = new Map<string, string>()
       for (const src of shape.contours) {
-        const pts = src.points.map((p) => {
-          const x = mirrorX ? b.maxX - (p.x - b.minX) : p.x
-          const y = mirrorY ? b.maxY - (p.y - b.minY) : p.y
+        const pts = src.points.map((pp) => {
+          const x = mirrorX ? b.maxX - (pp.x - b.minX) : pp.x
+          const y = mirrorY ? b.maxY - (pp.y - b.minY) : pp.y
           return { x: x - b.minX + ox, y: y - b.minY + oy }
         })
         const nc = makeContour(pts, src.closed, src.warnings.filter((wn) => wn === 'not_closed' || wn === 'self_intersect'))
+        idMap.set(src.id, nc.id)
         contours.push(nc)
+      }
+      tileIdMaps.push(idMap)
+    }
+  }
+  const manualParents: ManualParentMap = new Map()
+  if (sourceManualParents) {
+    for (const idMap of tileIdMaps) {
+      for (const [srcChild, srcParent] of sourceManualParents.entries()) {
+        const child = idMap.get(srcChild)
+        if (!child) continue
+        manualParents.set(child, srcParent === null ? null : idMap.get(srcParent) ?? null)
       }
     }
   }
-  return { ...shape, id: shape.id, name: `${shape.name}（${cols}×${rows} 排版）`, contours }
+  const tiled: Shape = { ...shape, id: shape.id, name: `${shape.name}（${cols}×${rows} 排版）`, contours }
+  return { shape: tiled, manualParents }
 }
 
 function shapeStart(s: ComputedShape): Pt {

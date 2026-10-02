@@ -1,6 +1,6 @@
 import type { Bridge, ContourWarning, CutSettings, MaterialPreset, Pt, Shape } from './types'
 import { anchorsFromRuns, applyBridges, planBridges, type BridgeAnchor, type BridgeMetrics, type CutRun } from './bridges'
-import { buildContainmentTree, type NestingResult } from './nesting'
+import { buildContainmentTree, type ManualParentMap, type NestingResult } from './nesting'
 import { orderCut, type OrderResult } from './order'
 import { offsetPolygon } from './offset'
 import { boundsOf, mergeBounds, polygonArea, polylineLength, type Bounds } from './geometry'
@@ -34,6 +34,9 @@ export type ComputedShape = {
     fragmentCount: number
     cappedBridgeCount: number
     maxDepth: number
+    nestedCount: number
+    doubtfulCount: number
+    manualNestingCount: number
     netAreaMm2: number
     bbox: Bounds
     geometryDeviationMm: number
@@ -43,6 +46,8 @@ export type ComputedShape = {
   warningUpdates: Map<string, ContourWarning[]>
   elapsedMs: number
   signature: string
+  /** 人工父子判定（null = 置顶）；与 signature 分开参与缓存失效 */
+  manualParents: ManualParentMap | null
 }
 
 /** 几何签名：用于缓存失效判断（点坐标和 / 点数 / 参数） */
@@ -71,6 +76,13 @@ export function shapeSignature(shape: Shape, settings: CutSettings, material: Ma
     settings.useBladeOffset,
     material ? material.bladeOffsetMm : 0,
   ].join('|')
+}
+
+/** 人工父子判定签名：判定变化时让派生缓存失效 */
+export function manualNestingSignature(manualParents?: ManualParentMap | null): string {
+  if (!manualParents || manualParents.size === 0) return 'auto'
+  const parts = [...manualParents.entries()].map(([id, p]) => `${id}>${p ?? 'root'}`).sort()
+  return parts.join(',')
 }
 
 /** 把「按弧长比例」的缺口映射到（可能被刀补裁剪成多段的）刀路上 */
@@ -111,16 +123,19 @@ function mapGapsToLoops(
 
 /**
  * 单形状全流程：刀补 → 连刀点 → 包含树 → 切割顺序（先内后外 + 跳刀优化）。
- * 纯函数，不修改传入的 shape。
+ * 纯函数，不修改传入的 shape（holes 为派生计数值，会被重写）。
+ *
+ * manualParents：人工父子判定覆盖（id → 父级 id 或 null=顶层）。
  */
 export function computeShape(
   shape: Shape,
   settings: CutSettings,
   material: MaterialPreset | null,
   start: Pt = { x: 0, y: 0 },
+  manualParents?: ManualParentMap | null,
 ): ComputedShape {
   const t0 = performance.now()
-  const tree = buildContainmentTree(shape.contours)
+  const tree = buildContainmentTree(shape.contours, manualParents ?? undefined)
 
   const byId = new Map<string, ComputedContour>()
   const runsOf = new Map<string, CutRun[]>()
@@ -241,6 +256,9 @@ export function computeShape(
       fragmentCount,
       cappedBridgeCount,
       maxDepth: tree.maxDepth,
+      nestedCount: tree.nestedCount,
+      doubtfulCount: tree.doubtfulIds.size,
+      manualNestingCount: tree.manualIds.size,
       netAreaMm2,
       bbox,
       geometryDeviationMm,
@@ -249,6 +267,7 @@ export function computeShape(
     warningUpdates,
     elapsedMs: performance.now() - t0,
     signature: shapeSignature(shape, settings, material),
+    manualParents: manualParents ? new Map(manualParents) : null,
   }
 }
 

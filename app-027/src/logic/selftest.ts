@@ -7,6 +7,9 @@ import { computeShape } from './pipeline'
 import { buildJob } from './job'
 import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
 import { polygonArea, polylineLength } from './geometry'
+import { buildContainmentTree } from './nesting'
+import { contourFingerprint, overridesForShape, recordOverride, shapeFingerprint, contourFingerprintMap } from './identity'
+import type { ManualParentMap } from './nesting'
 
 export type CheckResult = {
   id: string
@@ -450,6 +453,162 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
       '刀补超出轮廓尺度时明确警告并保留原路径（不输出坏路径）',
       !tinyOk && tinyMsg.includes('原路径') && tinyRuns > 0,
       `0.3mm 细长条（内层，向内侧偏置 ${mat.bladeOffsetMm}mm）：${tinyMsg}｜仍输出 ${tinyRuns} 段原路径`,
+    ),
+  )
+
+  // ---------- 10. 包含关系核对：贴边 / 断框存疑标记 ----------
+  const outer = rectContour('nt_outer', 0, 0, 100, 100)
+  // 内孔与外框贴边：左边与外框左边完全重合（贴边间距 0）
+  const touching: Shape['contours'][number] = {
+    id: 'nt_touch',
+    points: [
+      { x: 0, y: 30 },
+      { x: 20, y: 30 },
+      { x: 20, y: 50 },
+      { x: 0, y: 50 },
+    ],
+    closed: true,
+    area: 400,
+    length: 80,
+    holes: [],
+    bridges: [],
+    warnings: [],
+  }
+  const touchShape: Shape = { id: 'nt_touch_shape', name: '贴边用例', layer: 0, contours: [outer, touching] }
+  const touchTree = buildContainmentTree(touchShape.contours)
+  const touchInfo = touchTree.infoById.get('nt_touch')
+  const touchFlagged = touchInfo?.doubts.some((d) => d.kind === 'boundary_near') ?? false
+  checks.push(
+    ok(
+      'nesting-doubt-touch',
+      '两条轮廓贴边时自动判定标为存疑（boundary_near，间距量化）',
+      touchFlagged && (touchInfo?.doubts.find((d) => d.kind === 'boundary_near')?.value ?? 1) <= 0.5,
+      touchInfo
+        ? `贴边内孔存疑 ${touchInfo.doubts.length} 条：${touchInfo.doubts.map((d) => d.text).join('；')}`
+        : '未生成判定明细',
+    ),
+  )
+
+  // 外框断成两段：左/上边一条未闭合折线，内容小方块应被提示「附近有断开的外框」
+  const openFrame: Shape['contours'][number] = {
+    id: 'nt_openframe',
+    points: [
+      { x: 0, y: 100 },
+      { x: 0, y: 0 },
+      { x: 100, y: 0 },
+    ],
+    closed: false,
+    area: 0,
+    length: 200,
+    holes: [],
+    bridges: [],
+    warnings: [],
+  }
+  const inner = rectContour('nt_inner', 0.8, 0.8, 30, 30)
+  const brokenShape: Shape = { id: 'nt_broken', name: '断框用例', layer: 0, contours: [openFrame, inner] }
+  const brokenTree = buildContainmentTree(brokenShape.contours)
+  const innerInfo = brokenTree.infoById.get('nt_inner')
+  const brokenFlagged = innerInfo?.doubts.some((d) => d.kind === 'nearby_open_frame') ?? false
+  checks.push(
+    ok(
+      'nesting-doubt-broken-frame',
+      '外框断成两段（未闭合）时，附近轮廓标「可能是断开的外框，归属需核对」',
+      brokenFlagged,
+      innerInfo ? innerInfo.doubts.map((d) => d.text).join('；') || '无存疑标记' : '未生成判定明细',
+    ),
+  )
+
+  // 面积接近 + 代表点贴边：大孔几乎和外框一样大
+  const bigHole = rectContour('nt_bighole', 1, 1, 98, 98)
+  const closeShape: Shape = { id: 'nt_close', name: '面积接近用例', layer: 0, contours: [rectContour('nt_o2', 0, 0, 100, 100), bigHole] }
+  const closeTree = buildContainmentTree(closeShape.contours)
+  const closeInfo = closeTree.infoById.get('nt_bighole')
+  const closeFlagged = closeInfo?.doubts.some((d) => d.kind === 'area_close' || d.kind === 'rep_near_edge' || d.kind === 'boundary_near') ?? false
+  checks.push(
+    ok(
+      'nesting-doubt-close',
+      '父子面积接近 / 代表点离边太近时标为存疑',
+      closeFlagged,
+      closeInfo ? closeInfo.doubts.map((d) => d.text).join('；') : '未生成判定明细',
+    ),
+  )
+
+  // ---------- 11. 人工覆盖：改父级 → 层深 / 顺序 / 刀补方向 / 净面积全部重算 ----------
+  const boxA = rectContour('nt_a', 0, 0, 100, 100)
+  const boxB = rectContour('nt_b', 10, 10, 80, 80)
+  const boxC = rectContour('nt_c', 20, 20, 20, 20)
+  const triad: Shape = { id: 'nt_triad', name: '人工覆盖用例', layer: 0, contours: [boxA, boxB, boxC] }
+  const autoComp = computeShape(triad, settings, mat)
+  // 自动：a(depth1) > b(depth2) > c(depth3)；净面积 = 10000 - 6400 + 400 = 4000
+  const autoDepths = [autoComp.tree.depthOf.get('nt_a'), autoComp.tree.depthOf.get('nt_b'), autoComp.tree.depthOf.get('nt_c')]
+  // 人工把 b 置顶：b 变成顶层 depth1，c 仍是 a 的内层 depth2
+  const manual: ManualParentMap = new Map([['nt_b', null]])
+  const manualComp = computeShape(triad, settings, mat, { x: 0, y: 0 }, manual)
+  const manualDepths = [manualComp.tree.depthOf.get('nt_a'), manualComp.tree.depthOf.get('nt_b'), manualComp.tree.depthOf.get('nt_c')]
+  // 顺序：自动时 b 在 a 之前；b 置顶后（两个顶层），b 不再先于 a 的判定变成同层排序——关键看净面积：
+  // 自动 4000；置顶后 a(d1)-c(d2) + b(d1) = 10000 - 400 + 6400 = 16000
+  const netOk = Math.abs(autoComp.stats.netAreaMm2 - 4000) < 1e-6 && Math.abs(manualComp.stats.netAreaMm2 - 16000) < 1e-6
+  const depthOk = autoDepths.join() === '1,2,3' && manualDepths.join() === '1,1,2'
+  // 刀补方向随层深翻转：b 从 depth2（向内）变 depth1（向外）
+  checks.push(
+    ok(
+      'nesting-manual-recompute',
+      '手工改父级 / 置顶后，层深、切割顺序、刀补方向、净面积全部重算',
+      depthOk && netOk,
+      `自动层深 ${autoDepths.join('/')} 净面积 ${autoComp.stats.netAreaMm2.toFixed(0)}mm² → ` +
+        `人工置顶 b 后 ${manualDepths.join('/')} 净面积 ${manualComp.stats.netAreaMm2.toFixed(0)}mm²（b 的刀补由向内翻为向外）`,
+    ),
+  )
+
+  // 成环拒绝：a→b→a 之类；构造 a 指定到 c（c 的祖先链含 a）应被拒绝且自动判定不变
+  const cyclic: ManualParentMap = new Map([['nt_a', 'nt_c']])
+  const cycleTree = buildContainmentTree(triad.contours, cyclic)
+  const aInfo = cycleTree.infoById.get('nt_a')
+  const cycleRejected = aInfo?.manualIssue !== null && aInfo?.parentId === null
+  checks.push(
+    ok(
+      'nesting-manual-cycle',
+      '人工指定形成嵌套环时拒绝该条并回退自动判定（留痕标红，不出坏树）',
+      cycleRejected,
+      aInfo ? `a 的人工指定：${aInfo.manualIssue ?? '已生效（不应发生）'}；生效父级 = ${aInfo.parentId ?? '顶层'}` : '无明细',
+    ),
+  )
+
+  // ---------- 12. 留痕：重新导入同一张图（新 id + 平移/反向）按指纹恢复人工判定 ----------
+  const srcFps = contourFingerprintMap(triad.contours)
+  const shapeFp = shapeFingerprint(triad.contours)
+  recordOverride(shapeFp, srcFps, 'nt_b', null)
+  // 模拟「重新导入」：全新轮廓（新 id）、整体平移 25.4mm、点序反向、起点旋转
+  const reimported: Shape['contours'][number][] = triad.contours.map((c) => {
+    const pts = c.points
+      .slice()
+      .reverse()
+      .map((p) => ({ x: p.x + 25.4, y: p.y + 25.4 }))
+    return {
+      id: `re_${c.id}`,
+      points: pts,
+      closed: c.closed,
+      area: polygonArea(pts),
+      length: polylineLength(pts, c.closed),
+      holes: [],
+      bridges: [],
+      warnings: [],
+    }
+  })
+  const reFps = contourFingerprintMap(reimported)
+  const reShapeFp = shapeFingerprint(reimported)
+  const restored = overridesForShape(reShapeFp, reFps)
+  const fpStable = triad.contours.every((c, i) => contourFingerprint(c.points, c.closed) === contourFingerprint(reimported[i].points, true))
+  const restoredOk = reShapeFp === shapeFp && fpStable && restored.get('re_nt_b') === null && restored.size === 1
+  const reTree = buildContainmentTree(reimported, restored)
+  const restoredDepth = reTree.depthOf.get('re_nt_b')
+  checks.push(
+    ok(
+      'nesting-trace-reimport',
+      '人工判定按几何指纹留痕：重新导入同一张图（新 id、平移、反向、起点变化）自动恢复',
+      restoredOk && restoredDepth === 1,
+      `图样指纹一致 = ${reShapeFp === shapeFp}｜轮廓指纹与起点/方向/平移无关 = ${fpStable}｜` +
+        `恢复人工判定 ${restored.size} 条，置顶轮廓 b 重导后层深 = ${restoredDepth}`,
     ),
   )
 
